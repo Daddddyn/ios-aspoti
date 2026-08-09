@@ -1,0 +1,115 @@
+name: Build Aspotï IPA
+
+# Runs on every push to main, or manually from the Actions tab
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15        # Free GitHub-hosted Mac runner with Xcode 16
+    timeout-minutes: 30
+
+    steps:
+      # ── 1. Check out your repo ──────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Node.js ───────────────────────────────────────────
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # ── 3. Install Capacitor ────────────────────────────────────────
+      - name: Install dependencies
+        run: npm ci
+
+      # ── 4. Copy web files into www/ ─────────────────────────────────
+      - name: Build web
+        run: node build.js
+
+      # ── 5. Add iOS platform (skips if already present) ─────────────
+      - name: Add iOS platform
+        run: |
+          if [ ! -d "ios" ]; then
+            npx cap add ios
+          else
+            echo "ios/ already exists, skipping add"
+          fi
+
+      # ── 6. Patch AppDelegate.swift (background audio) ───────────────
+      - name: Patch AppDelegate for background audio
+        run: |
+          cp ios-support/AppDelegate.swift ios/App/App/AppDelegate.swift
+          echo "✓ AppDelegate patched"
+
+      # ── 7. Patch Info.plist (UIBackgroundModes + ATS) ───────────────
+      - name: Patch Info.plist
+        run: |
+          PLIST="ios/App/App/Info.plist"
+          # Add UIBackgroundModes if not already present
+          if ! grep -q "UIBackgroundModes" "$PLIST"; then
+            # Insert before the closing </dict></plist>
+            sed -i '' 's|</dict>$|    <key>UIBackgroundModes</key>\
+              <array><string>audio</string></array>\
+              <key>NSAppTransportSecurity</key>\
+              <dict><key>NSAllowsArbitraryLoads</key><true/></dict>\
+              <key>NSMicrophoneUsageDescription</key>\
+              <string>Aspoti does not use the microphone.</string>\
+          </dict>|' "$PLIST"
+            echo "✓ Info.plist patched"
+          else
+            echo "Info.plist already patched, skipping"
+          fi
+
+      # ── 8. Sync Capacitor ───────────────────────────────────────────
+      - name: Cap sync
+        run: npx cap sync ios
+
+      # ── 9. Install CocoaPods ────────────────────────────────────────
+      - name: Pod install
+        run: |
+          cd ios/App
+          pod install --repo-update
+
+      # ── 10. Build unsigned IPA ──────────────────────────────────────
+      # We build for "generic/platform=iOS" (no simulator) and sign
+      # with CODE_SIGNING_ALLOWED=NO so no certificate is needed.
+      # AltServer will re-sign it with your Apple ID on your Windows PC.
+      - name: Build unsigned IPA
+        run: |
+          cd ios/App
+          xcodebuild \
+            -workspace App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -archivePath $RUNNER_TEMP/App.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            PROVISIONING_PROFILE="" \
+            archive
+
+      # ── 11. Package into .ipa ───────────────────────────────────────
+      - name: Package IPA
+        run: |
+          ARCHIVE="$RUNNER_TEMP/App.xcarchive"
+          PAYLOAD_DIR="$RUNNER_TEMP/Payload"
+          mkdir -p "$PAYLOAD_DIR"
+          cp -r "$ARCHIVE/Products/Applications/App.app" "$PAYLOAD_DIR/"
+          cd "$RUNNER_TEMP"
+          zip -r Aspoti.ipa Payload/
+          echo "✓ Aspoti.ipa created"
+
+      # ── 12. Upload IPA as a downloadable artifact ───────────────────
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Aspoti-IPA
+          path: ${{ runner.temp }}/Aspoti.ipa
+          retention-days: 30
