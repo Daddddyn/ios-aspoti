@@ -41,45 +41,56 @@ const save = {
 
 /* ════════════════════════════════════════════════════
    NATIVE AUDIO ENGINE
-   Priority: Piped instances → Invidious instances
-   Falls back through list until one works.
-   The <audio> element is a first-class browser citizen
-   so iOS respects it for lock screen + background play.
+   Uses a real <audio> element — iOS keeps this playing
+   in background / screen off. YouTube iframes cannot do this.
+
+   Stream resolution: races multiple Piped + Invidious
+   instances in parallel, takes the fastest winner.
+   Caches the last working instance to start fast next time.
    ════════════════════════════════════════════════════ */
 
-// Multiple instances so we always have a fallback
+// Piped instances — each exposes GET /streams/{videoId}
+// returning { audioStreams: [{ url, bitrate, videoOnly }] }
 const PIPED_INSTANCES = [
   'https://pipedapi.kavin.rocks',
   'https://pipedapi.adminforge.de',
-  'https://api.piped.projectsegfau.lt',
-  'https://pipedapi.moomoo.me',
-  'https://pa.il.ax',
+  'https://pipedapi.ducks.party',
+  'https://api.piped.yt',
+  'https://pipedapi.reallyaweso.me',
+  'https://api.piped.private.coffee',
+  'https://piped-api.privacy.com.de',
+  'https://pipedapi.darkness.services',
+  'https://pipedapi.nosebs.ru',
+  'https://pipedapi.leptons.xyz',
 ];
 
+// Invidious instances — GET /api/v1/videos/{videoId}?fields=adaptiveFormats
 const INVIDIOUS_INSTANCES = [
   'https://yewtu.be',
-  'https://invidious.nerdvpn.de',
   'https://inv.nadeko.net',
   'https://invidious.privacyredirect.com',
+  'https://invidious.nerdvpn.de',
+  'https://iv.melmac.space',
+  'https://invidious.fdn.fr',
 ];
 
-// The single native audio element — this is what iOS respects
+// Remember which instance worked last (persisted across plays in session)
+let _lastGoodPiped = 0;
+let _lastGoodInv   = 0;
+
+// The single native audio element
 const AUDIO = new Audio();
 AUDIO.preload = 'none';
-AUDIO.crossOrigin = 'anonymous';
-// iOS requires playsinline equivalent for audio sessions
 AUDIO.setAttribute('playsinline', '');
 
 // Wire up audio events
-AUDIO.addEventListener('play',    () => onAudioPlay());
-AUDIO.addEventListener('pause',   () => onAudioPause());
-AUDIO.addEventListener('ended',   () => onAudioEnded());
-AUDIO.addEventListener('error',   () => onAudioError());
-AUDIO.addEventListener('waiting', () => showLoadingState(true));
-AUDIO.addEventListener('canplay', () => showLoadingState(false));
-AUDIO.addEventListener('loadedmetadata', () => {
-  state.currentDuration = AUDIO.duration || 0;
-});
+AUDIO.addEventListener('play',            () => onAudioPlay());
+AUDIO.addEventListener('pause',           () => onAudioPause());
+AUDIO.addEventListener('ended',           () => onAudioEnded());
+AUDIO.addEventListener('error',           () => onAudioError());
+AUDIO.addEventListener('waiting',         () => showLoadingState(true));
+AUDIO.addEventListener('canplay',         () => showLoadingState(false));
+AUDIO.addEventListener('loadedmetadata',  () => { state.currentDuration = AUDIO.duration || 0; });
 
 function onAudioPlay() {
   state.playing = true;
@@ -107,79 +118,154 @@ function onAudioEnded() {
 }
 
 function onAudioError() {
-  console.warn('Audio error, trying next fallback or skipping');
-  // If we were loading a track, try the next instance
-  if (state.currentTrack && state._streamAttempt < (PIPED_INSTANCES.length + INVIDIOUS_INSTANCES.length - 1)) {
-    state._streamAttempt = (state._streamAttempt || 0) + 1;
-    loadStreamForTrack(state.currentTrack, state._streamAttempt);
+  // The URL we got worked at fetch time but failed to stream — try next batch
+  console.warn('Audio stream error, retrying with next sources');
+  if (state.currentTrack && !state._streamExhausted) {
+    state._streamExhausted = true; // prevent infinite loop
+    loadStreamForTrack(state.currentTrack, true /* skipFirst */);
   } else {
     showLoadingState(false);
-    toast('Could not load audio — skipping');
-    setTimeout(() => seekNext(), 1500);
+    toast('Stream failed — tap ↻ to retry or skip');
+    showRetryButton(true);
   }
 }
 
 /* ── STREAM RESOLUTION ── */
-// Tries each instance in order; first one to return a valid audio URL wins
-async function resolveAudioUrl(videoId, attempt = 0) {
-  const allInstances = [
-    ...PIPED_INSTANCES.map(u => ({ type: 'piped', url: u })),
-    ...INVIDIOUS_INSTANCES.map(u => ({ type: 'invidious', url: u })),
-  ];
-
-  if (attempt >= allInstances.length) return null;
-  const inst = allInstances[attempt];
-
-  try {
-    if (inst.type === 'piped') {
-      const res = await fetch(`${inst.url}/streams/${videoId}`, { signal: AbortSignal.timeout(6000) });
-      if (!res.ok) throw new Error('not ok');
-      const data = await res.json();
-      // Pick best audio stream (highest bitrate, not videoOnly)
-      const streams = (data.audioStreams || []).filter(s => !s.videoOnly);
-      if (!streams.length) throw new Error('no audio streams');
-      streams.sort((a, b) => b.bitrate - a.bitrate);
-      return streams[0].url;
-    } else {
-      // Invidious
-      const res = await fetch(`${inst.url}/api/v1/videos/${videoId}?fields=adaptiveFormats`, { signal: AbortSignal.timeout(6000) });
-      if (!res.ok) throw new Error('not ok');
-      const data = await res.json();
-      const formats = (data.adaptiveFormats || []).filter(f => f.type?.startsWith('audio/'));
-      if (!formats.length) throw new Error('no audio formats');
-      formats.sort((a, b) => parseInt(b.bitrate) - parseInt(a.bitrate));
-      return formats[0].url;
-    }
-  } catch (e) {
-    console.warn(`Instance ${inst.url} failed:`, e.message);
-    return resolveAudioUrl(videoId, attempt + 1);
-  }
+// Fetches one Piped instance
+async function tryPiped(baseUrl, videoId, signal) {
+  const res = await fetch(`${baseUrl}/streams/${videoId}`, { signal });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  const streams = (data.audioStreams || []).filter(s => !s.videoOnly && s.url);
+  if (!streams.length) throw new Error('no audio streams');
+  streams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+  return streams[0].url;
 }
 
-async function loadStreamForTrack(track, attempt = 0) {
-  state._streamAttempt = attempt;
-  showLoadingState(true);
+// Fetches one Invidious instance
+async function tryInvidious(baseUrl, videoId, signal) {
+  const res = await fetch(`${baseUrl}/api/v1/videos/${videoId}?fields=adaptiveFormats`, { signal });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  const formats = (data.adaptiveFormats || []).filter(f => f.type?.startsWith('audio/') && f.url);
+  if (!formats.length) throw new Error('no audio formats');
+  formats.sort((a, b) => parseInt(b.bitrate || 0) - parseInt(a.bitrate || 0));
+  return formats[0].url;
+}
 
-  const audioUrl = await resolveAudioUrl(track.videoId, attempt);
+// Races a batch of instances — returns the first URL that resolves
+async function raceBatch(fetchers) {
+  return new Promise((resolve, reject) => {
+    let settled = 0;
+    let resolved = false;
+    const total = fetchers.length;
+    if (!total) { reject(new Error('no fetchers')); return; }
+    fetchers.forEach(fn => {
+      fn().then(url => {
+        if (!resolved) { resolved = true; resolve(url); }
+      }).catch(() => {
+        settled++;
+        if (settled === total && !resolved) reject(new Error('all failed'));
+      });
+    });
+  });
+}
+
+// Main resolver: races first-choice instances, falls back to rest if needed
+async function resolveAudioUrl(videoId, skipFirst = false) {
+  const TIMEOUT = 7000;
+
+  // Build ordered instance lists, starting from last known-good
+  const pipedOrdered = [
+    ...PIPED_INSTANCES.slice(_lastGoodPiped),
+    ...PIPED_INSTANCES.slice(0, _lastGoodPiped),
+  ];
+  const invOrdered = [
+    ...INVIDIOUS_INSTANCES.slice(_lastGoodInv),
+    ...INVIDIOUS_INSTANCES.slice(0, _lastGoodInv),
+  ];
+
+  // First wave: race top 3 of each type simultaneously
+  if (!skipFirst) {
+    const ac1 = new AbortController();
+    const t1  = setTimeout(() => ac1.abort(), TIMEOUT);
+    try {
+      const firstWave = [
+        ...pipedOrdered.slice(0, 3).map((u, i) => async () => {
+          const url = await tryPiped(u, videoId, ac1.signal);
+          _lastGoodPiped = PIPED_INSTANCES.indexOf(u);
+          return url;
+        }),
+        ...invOrdered.slice(0, 2).map((u, i) => async () => {
+          const url = await tryInvidious(u, videoId, ac1.signal);
+          _lastGoodInv = INVIDIOUS_INSTANCES.indexOf(u);
+          return url;
+        }),
+      ];
+      const url = await raceBatch(firstWave);
+      clearTimeout(t1);
+      return url;
+    } catch {
+      clearTimeout(t1);
+      // Fall through to second wave
+    }
+  }
+
+  // Second wave: try the remaining instances sequentially
+  const remaining = [
+    ...pipedOrdered.slice(skipFirst ? 0 : 3).map(u => ({ type: 'piped', u })),
+    ...invOrdered.slice(skipFirst ? 0 : 2).map(u => ({ type: 'inv', u })),
+  ];
+  for (const { type, u } of remaining) {
+    const ac = new AbortController();
+    const t  = setTimeout(() => ac.abort(), TIMEOUT);
+    try {
+      const url = type === 'piped'
+        ? await tryPiped(u, videoId, ac.signal)
+        : await tryInvidious(u, videoId, ac.signal);
+      clearTimeout(t);
+      if (type === 'piped') _lastGoodPiped = PIPED_INSTANCES.indexOf(u);
+      else                  _lastGoodInv   = INVIDIOUS_INSTANCES.indexOf(u);
+      return url;
+    } catch {
+      clearTimeout(t);
+    }
+  }
+  return null;
+}
+
+async function loadStreamForTrack(track, skipFirst = false) {
+  state._streamExhausted = false;
+  showLoadingState(true);
+  showRetryButton(false);
+
+  const audioUrl = await resolveAudioUrl(track.videoId, skipFirst);
 
   if (!audioUrl) {
     showLoadingState(false);
-    toast('No audio source found — skipping');
-    setTimeout(() => seekNext(), 1500);
+    showRetryButton(true);
+    toast('No audio source available — tap ↻ to retry');
     return;
   }
 
-  // Only apply if this track is still the current one
+  // Bail if user switched tracks while we were fetching
   if (state.currentTrack?.videoId !== track.videoId) return;
 
   AUDIO.src = audioUrl;
   AUDIO.volume = state.volumeLevel / 100;
   AUDIO.load();
   AUDIO.play().catch(e => {
-    console.warn('play() blocked:', e);
+    console.warn('play() rejected:', e.message);
     showLoadingState(false);
     updatePlayIcons(false);
   });
+}
+
+// Show/hide a retry button in the now-playing sheet
+function showRetryButton(show) {
+  let btn = el('np-retry');
+  if (!btn) return;
+  btn.style.display = show ? '' : 'none';
 }
 
 /* ── PLAYBACK CONTROLS ── */
@@ -199,8 +285,8 @@ async function playTrack(track, queueOverride, idx) {
   showLoadingState(true);
   addToHistory(track);
 
-  // Kick off stream resolution
-  loadStreamForTrack(track, 0);
+  // Kick off stream resolution (race first batch of instances)
+  loadStreamForTrack(track, false);
 }
 
 function togglePlayPause() {
@@ -210,7 +296,7 @@ function togglePlayPause() {
   } else {
     if (!AUDIO.src || AUDIO.src === window.location.href) {
       // No src yet — reload stream
-      loadStreamForTrack(state.currentTrack, 0);
+      loadStreamForTrack(state.currentTrack, false);
     } else {
       AUDIO.play().catch(() => {});
     }
@@ -856,6 +942,17 @@ document.addEventListener('DOMContentLoaded', () => {
   el('np-add-to-playlist').addEventListener('click', () => { if (state.currentTrack) openAddToPlaylist(state.currentTrack); });
   el('np-more').addEventListener('click', () => { if (state.currentTrack) showTrackMenu(state.currentTrack); });
   el('np-airplay').addEventListener('click', () => toast('Use AirPlay from Control Center'));
+
+  // Retry button — shown when all sources fail, lets user try again without skipping
+  const npRetry = el('np-retry');
+  if (npRetry) {
+    npRetry.addEventListener('click', () => {
+      if (state.currentTrack) {
+        showRetryButton(false);
+        loadStreamForTrack(state.currentTrack, false);
+      }
+    });
+  }
 
   el('np-shuffle').addEventListener('click', () => {
     state.shuffle = !state.shuffle;
