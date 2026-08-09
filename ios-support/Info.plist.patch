@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PASTE EVERYTHING BETWEEN THE <additions> TAGS
+  into ios/App/App/Info.plist, just before the final </dict></plist>
+-->
+<additions>
+
+    <!-- Required: tells iOS this app is allowed to play audio in background -->
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>audio</string>
+    </array>
+
+    <!-- Required: allows fetching audio stream URLs over HTTP from Piped proxy instances -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <true/>
+    </dict>
+
+    <!-- Required by App Store even if unused -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Aspotï does not use the microphone.</string>
+
+</additions>
