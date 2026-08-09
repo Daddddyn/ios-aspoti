@@ -340,6 +340,11 @@
       </button>
     </div>
 
+    <!-- Shown only when all audio sources fail -->
+    <button id="np-retry" style="display:none;margin:0 auto 12px;padding:10px 28px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);border-radius:20px;color:#fff;font-size:15px;font-weight:600;letter-spacing:.3px;">
+      ↻ Try again
+    </button>
+
     <div class="np-volume-wrap">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" opacity=".5"><path d="M11 5L6 9H2v6h4l5 4V5zM15.54 8.46a5 5 0 010 7.07M19.07 4.93a10 10 0 010 14.14" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/></svg>
       <input type="range" id="np-volume" class="volume-slider" min="0" max="100" value="80" step="1" aria-label="Volume" />
