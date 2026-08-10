@@ -4,8 +4,7 @@
   "webDir": "www",
   "server": {
     "hostname": "localhost",
-    "iosScheme": "http",
-    "androidScheme": "http"
+    "androidScheme": "https"
   },
   "ios": {
     "allowsLinkPreview": false,
