@@ -91,82 +91,52 @@ function onAudioError() {
   }
 }
 
-/* ── YouTube Internal Player API ──────────────────────
-   Mimics the native YouTube iOS app client.
-   Returns streamingData with direct audio-only URLs.
-   This is what yt-dlp uses internally (IOS client).
+/* ── AUDIO STREAM RESOLVER ─────────────────────────────
+   Uses Piped public API instances (server-side proxies).
+   The YouTube internal IOS client API is blocked in
+   WKWebView because iOS strips the Referer header that
+   YouTube requires. Piped runs server-side so it has no
+   such restriction and returns a proxied stream URL that
+   the <audio> element can play directly.
    ───────────────────────────────────────────────────── */
-const YT_API_KEY = 'AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUA'; // public yt-dlp IOS key
+const PIPED_INSTANCES = [
+  'https://pipedapi.kavin.rocks',
+  'https://pipedapi.adminforge.de',
+  'https://api.piped.yt',
+  'https://pipedapi.drgns.space',
+];
 
-async function fetchYTPlayerData(videoId, signal) {
-  const body = {
-    videoId,
-    context: {
-      client: {
-        clientName: 'IOS',
-        clientVersion: '19.29.1',
-        deviceModel: 'iPhone16,2',
-        userAgent: 'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5 like Mac OS X)',
-        hl: 'en',
-        gl: 'US',
-        osName: 'iPhone',
-        osVersion: '17.5.1',
-        platform: 'MOBILE',
-      },
-    },
-    playbackContext: {
-      contentPlaybackContext: { html5Preference: 'HTML5_PREF_WANTS' },
-    },
-    racyCheckOk: true,
-    contentCheckOk: true,
-  };
-
-  const res = await fetch(
-    `https://www.youtube.com/youtubei/v1/player?key=${YT_API_KEY}&prettyPrint=false`,
-    {
-      method: 'POST',
-      signal,
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': 'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5 like Mac OS X)',
-        'X-Youtube-Client-Name': '5',
-        'X-Youtube-Client-Version': '19.29.1',
-        'Origin': 'https://www.youtube.com',
-      },
-      body: JSON.stringify(body),
-    }
-  );
-
-  if (!res.ok) throw new Error(`YT internal API: HTTP ${res.status}`);
+async function fetchPipedStream(videoId, baseUrl, signal) {
+  const res = await fetch(`${baseUrl}/streams/${videoId}`, { signal });
+  if (!res.ok) throw new Error(`Piped ${baseUrl}: HTTP ${res.status}`);
   const data = await res.json();
 
-  // Check playability
-  const status = data.playabilityStatus?.status;
-  if (status === 'UNPLAYABLE' || status === 'ERROR' || status === 'LOGIN_REQUIRED') {
-    throw new Error(`Unplayable: ${data.playabilityStatus?.reason || status}`);
-  }
+  if (!data.audioStreams?.length) throw new Error('No audio streams');
 
-  // Pick best audio-only adaptive format
-  const formats = (data.streamingData?.adaptiveFormats || [])
-    .filter(f => f.mimeType?.startsWith('audio/') && f.url);
-  if (!formats.length) throw new Error('No audio formats in response');
-
-  formats.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-  return formats[0].url;
+  // Prefer M4A (best iOS compat), then highest bitrate
+  const streams = data.audioStreams.filter(s => !s.videoOnly);
+  const m4a = streams.filter(s => s.mimeType?.includes('mp4') || s.format === 'M4A');
+  const pick = (m4a.length ? m4a : streams).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+  if (!pick?.url) throw new Error('No usable audio URL');
+  return pick.url;
 }
 
 async function resolveAudioUrl(videoId) {
-  const ac = new AbortController();
-  const t  = setTimeout(() => ac.abort(), 12000);
-  try {
-    const url = await fetchYTPlayerData(videoId, ac.signal);
-    clearTimeout(t);
-    return url;
-  } catch (err) {
-    clearTimeout(t);
-    console.warn('YT internal API failed:', err.message);
-    return null;
+  for (const instance of PIPED_INSTANCES) {
+    const ac = new AbortController();
+    const t  = setTimeout(() => ac.abort(), 10000);
+    try {
+      const url = await fetchPipedStream(videoId, instance, ac.signal);
+      clearTimeout(t);
+      console.log(`✓ Stream from ${instance}`);
+      return url;
+    } catch (err) {
+      clearTimeout(t);
+      console.warn(`✗ ${instance}: ${err.message}`);
+    }
   }
+  console.error('All Piped instances failed for', videoId);
+  return null;
 }
 
 async function loadStream(track) {
@@ -485,8 +455,16 @@ function switchPage(pageId) {
   if (pageId === 'page-home')    renderHome();
 }
 
-function openNowPlaying()  { el('now-playing-sheet').classList.remove('hidden'); }
-function closeNowPlaying() { el('now-playing-sheet').classList.add('hidden'); }
+function openNowPlaying()  {
+  const sheet = el('now-playing-sheet');
+  sheet.style.visibility = '';
+  sheet.classList.remove('hidden');
+}
+function closeNowPlaying() {
+  const sheet = el('now-playing-sheet');
+  sheet.classList.add('hidden');
+  setTimeout(() => { if (sheet.classList.contains('hidden')) sheet.style.visibility = 'hidden'; }, 420);
+}
 
 /* ── PLAYLIST DETAIL ── */
 function openPlaylistDetail(id) {
