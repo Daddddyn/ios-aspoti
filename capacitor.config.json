@@ -2,6 +2,11 @@
   "appId": "com.aspoti.app",
   "appName": "Aspotï",
   "webDir": "www",
+  "server": {
+    "hostname": "localhost",
+    "iosScheme": "http",
+    "androidScheme": "http"
+  },
   "ios": {
     "allowsLinkPreview": false,
     "scrollEnabled": false,
