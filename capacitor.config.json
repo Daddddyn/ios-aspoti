@@ -9,7 +9,6 @@
   },
   "ios": {
     "allowsLinkPreview": false,
-    "scrollEnabled": false,
     "preferredContentMode": "mobile"
   },
   "plugins": {
