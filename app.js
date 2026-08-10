@@ -298,8 +298,8 @@ function setupMediaSession(track) {
       { src: track.thumb, sizes: '640x360', type: 'image/jpeg' },
     ] : [],
   });
-  navigator.mediaSession.setActionHandler('play',          () => AUDIO.play().catch(() => {});
-  navigator.mediaSession.setActionHandler('pause',         () => AUDIO.pause();
+  navigator.mediaSession.setActionHandler('play',          () => AUDIO.play().catch(() => {}));
+  navigator.mediaSession.setActionHandler('pause',         () => AUDIO.pause());
   navigator.mediaSession.setActionHandler('previoustrack', () => seekPrev());
   navigator.mediaSession.setActionHandler('nexttrack',     () => seekNext());
   navigator.mediaSession.setActionHandler('seekto', e => {
