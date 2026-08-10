@@ -62,23 +62,29 @@ const save = {
   document.head.appendChild(s);
 })();
 
-/* ── Hidden iframe container (1×1, off-screen) ── */
-const _ytContainer = document.createElement('div');
-_ytContainer.style.cssText = 'position:fixed;left:-2px;top:-2px;width:1px;height:1px;opacity:0;pointer-events:none;';
-document.body.appendChild(_ytContainer);
+/* ── Hidden iframe container ── */
+(function createYTContainer() {
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';
+  const inner = document.createElement('div');
+  inner.id = 'yt-player';
+  wrap.appendChild(inner);
+  // Must be in DOM before YT.Player() is called
+  if (document.body) document.body.appendChild(wrap);
+  else document.addEventListener('DOMContentLoaded', () => document.body.appendChild(wrap));
+})();
 
 let YTPlayer   = null;   // the YT.Player instance
 let _ytReady   = false;  // API loaded
 let _pendingId = null;   // videoId to play once player is ready
-let _ytDurTimer = null;
 
 /* Called by YouTube IFrame API when it finishes loading */
 window.onYouTubeIframeAPIReady = function () {
   _ytReady = true;
-  YTPlayer = new YT.Player(_ytContainer, {
+  YTPlayer = new YT.Player('yt-player', {
     width: '1', height: '1',
     playerVars: {
-      autoplay: 0,
+      autoplay: 1,
       controls: 0,
       disablekb: 1,
       fs: 0,
@@ -86,6 +92,7 @@ window.onYouTubeIframeAPIReady = function () {
       modestbranding: 1,
       playsinline: 1,
       rel: 0,
+      origin: window.location.origin,
     },
     events: {
       onReady:       _onYTReady,
@@ -130,11 +137,20 @@ function _onYTStateChange(e) {
 }
 
 function _onYTError(e) {
-  console.warn('YT player error:', e.data);
-  // 100 = not found, 101/150 = embedding disabled
+  // Error codes: 2=bad param, 5=html5 error, 100=not found,
+  // 101/150=embed blocked by uploader (not by origin)
+  console.warn('YT player error code:', e.data);
   showLoadingState(false);
-  showRetryButton(true);
-  toast('Can\'t play this track — try the next one');
+  if (e.data === 100) {
+    toast('Video not found — skipping');
+    setTimeout(seekNext, 1200);
+  } else if (e.data === 101 || e.data === 150) {
+    toast('Embedding blocked for this video — skipping');
+    setTimeout(seekNext, 1200);
+  } else {
+    showRetryButton(true);
+    toast('Playback error (' + e.data + ') — tap ↻ to retry');
+  }
 }
 
 /* ── Core play/pause/seek wrappers ── */
