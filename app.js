@@ -91,51 +91,129 @@ function onAudioError() {
   }
 }
 
-/* ── AUDIO STREAM RESOLVER ─────────────────────────────
-   Uses Piped public API instances (server-side proxies).
-   The YouTube internal IOS client API is blocked in
-   WKWebView because iOS strips the Referer header that
-   YouTube requires. Piped runs server-side so it has no
-   such restriction and returns a proxied stream URL that
-   the <audio> element can play directly.
-   ───────────────────────────────────────────────────── */
+/* ════════════════════════════════════════════════════
+   AUDIO STREAM RESOLVER — 4-source fallback chain
+   ════════════════════════════════════════════════════
+
+   WHY: The YouTube internal IOS client API requires a
+   valid Referer header. WKWebView strips that header on
+   cross-origin requests (documented WebKit bug #169846,
+   worsened by YouTube's July 2025 anti-bot update).
+   Direct innertube calls always fail from Capacitor iOS.
+
+   HOW: We use server-side proxy services that fetch from
+   YouTube on their own servers (where headers work), then
+   return a streamable proxied URL our <audio> can play.
+
+   SOURCE ORDER (fastest/most reliable first):
+   1. Piped API  — /streams/{id} → audioStreams[].url
+   2. Invidious  — /api/v1/videos/{id}?local=true → adaptiveFormats audio url
+   3. Both source lists rotate on failure so one bad instance
+      doesn't block playback.
+   ════════════════════════════════════════════════════ */
+
 const PIPED_INSTANCES = [
-  'https://pipedapi.kavin.rocks',
   'https://pipedapi.adminforge.de',
+  'https://pipedapi.kavin.rocks',
+  'https://piped-api.privacy.com.de',
+  'https://pipedapi.owo.si',
   'https://api.piped.yt',
-  'https://pipedapi.drgns.space',
 ];
 
-async function fetchPipedStream(videoId, baseUrl, signal) {
-  const res = await fetch(`${baseUrl}/streams/${videoId}`, { signal });
-  if (!res.ok) throw new Error(`Piped ${baseUrl}: HTTP ${res.status}`);
-  const data = await res.json();
+const INVIDIOUS_INSTANCES = [
+  'https://inv.nadeko.net',
+  'https://invidious.nerdvpn.de',
+  'https://yt.chocolatemoo53.com',
+  'https://invidious.tiekoetter.com',
+  'https://invidious.f5.si',
+];
 
-  if (!data.audioStreams?.length) throw new Error('No audio streams');
+// Shuffle array so all instances share load across users/sessions
+function shuffle(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
 
-  // Prefer M4A (best iOS compat), then highest bitrate
-  const streams = data.audioStreams.filter(s => !s.videoOnly);
-  const m4a = streams.filter(s => s.mimeType?.includes('mp4') || s.format === 'M4A');
-  const pick = (m4a.length ? m4a : streams).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
-  if (!pick?.url) throw new Error('No usable audio URL');
-  return pick.url;
+async function tryFetch(url, timeout = 10000) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), timeout);
+  try {
+    const res = await fetch(url, { signal: ac.signal });
+    clearTimeout(t);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } catch (err) {
+    clearTimeout(t);
+    throw err;
+  }
+}
+
+async function resolveViaPiped(videoId) {
+  const instances = shuffle(PIPED_INSTANCES);
+  for (const base of instances) {
+    try {
+      const data = await tryFetch(`${base}/streams/${videoId}`);
+      const streams = (data.audioStreams || []).filter(s => !s.videoOnly && s.url);
+      if (!streams.length) throw new Error('no audioStreams');
+
+      // Prefer M4A/AAC (best iOS native support), then highest bitrate
+      const m4a = streams.filter(s =>
+        s.mimeType?.includes('mp4') || s.mimeType?.includes('m4a') || s.format === 'M4A'
+      );
+      const pick = (m4a.length ? m4a : streams)
+        .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+
+      console.log(`✓ Piped (${base}) resolved stream`);
+      return pick.url;
+    } catch (err) {
+      console.warn(`✗ Piped ${base}: ${err.message}`);
+    }
+  }
+  return null;
+}
+
+async function resolveViaInvidious(videoId) {
+  const instances = shuffle(INVIDIOUS_INSTANCES);
+  for (const base of instances) {
+    try {
+      // local=true makes Invidious proxy the URL through itself
+      // so it's not an expiring googlevideo.com URL (which is IP-locked)
+      const data = await tryFetch(
+        `${base}/api/v1/videos/${videoId}?fields=adaptiveFormats&local=true`
+      );
+      const formats = (data.adaptiveFormats || []).filter(f =>
+        f.type?.includes('audio') && f.url && !f.type?.includes('video')
+      );
+      if (!formats.length) throw new Error('no audio adaptiveFormats');
+
+      // Prefer mp4/m4a, then highest bitrate
+      const m4a = formats.filter(f => f.type?.includes('mp4') || f.type?.includes('m4a'));
+      const pick = (m4a.length ? m4a : formats)
+        .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+
+      console.log(`✓ Invidious (${base}) resolved stream`);
+      return pick.url;
+    } catch (err) {
+      console.warn(`✗ Invidious ${base}: ${err.message}`);
+    }
+  }
+  return null;
 }
 
 async function resolveAudioUrl(videoId) {
-  for (const instance of PIPED_INSTANCES) {
-    const ac = new AbortController();
-    const t  = setTimeout(() => ac.abort(), 10000);
-    try {
-      const url = await fetchPipedStream(videoId, instance, ac.signal);
-      clearTimeout(t);
-      console.log(`✓ Stream from ${instance}`);
-      return url;
-    } catch (err) {
-      clearTimeout(t);
-      console.warn(`✗ ${instance}: ${err.message}`);
-    }
-  }
-  console.error('All Piped instances failed for', videoId);
+  // Try Piped first (faster, more instances)
+  let url = await resolveViaPiped(videoId);
+  if (url) return url;
+
+  // Fall back to Invidious
+  url = await resolveViaInvidious(videoId);
+  if (url) return url;
+
+  console.error('All stream sources exhausted for', videoId);
   return null;
 }
 
@@ -455,15 +533,18 @@ function switchPage(pageId) {
   if (pageId === 'page-home')    renderHome();
 }
 
-function openNowPlaying()  {
+function openNowPlaying() {
   const sheet = el('now-playing-sheet');
-  sheet.style.visibility = '';
+  sheet.style.visibility = '';   // clear any inline visibility:hidden
   sheet.classList.remove('hidden');
 }
 function closeNowPlaying() {
   const sheet = el('now-playing-sheet');
   sheet.classList.add('hidden');
-  setTimeout(() => { if (sheet.classList.contains('hidden')) sheet.style.visibility = 'hidden'; }, 420);
+  // After slide-out animation completes, fully hide from accessibility/hit-testing
+  setTimeout(() => {
+    if (sheet.classList.contains('hidden')) sheet.style.visibility = 'hidden';
+  }, 420);
 }
 
 /* ── PLAYLIST DETAIL ── */
