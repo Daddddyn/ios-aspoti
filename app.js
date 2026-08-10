@@ -42,29 +42,30 @@ const save = {
 /* ════════════════════════════════════════════════════
    NATIVE AUDIO ENGINE
    Uses a real <audio> element — iOS keeps this playing
-   in background / screen off. YouTube iframes cannot do this.
+   in background / screen off when AVAudioSession is set
+   to .playback in the native AppDelegate (already done).
 
-   Stream resolution: races multiple Piped + Invidious
-   instances in parallel, takes the fastest winner.
-   Caches the last working instance to start fast next time.
+   Stream resolution chain (tried in order):
+     1. Cobalt API  — actively maintained, most reliable
+     2. Invidious   — fallback public instances
+     3. Piped       — last resort
+
+   All three return a direct audio URL that the <audio>
+   element can play without any proxy.
    ════════════════════════════════════════════════════ */
 
-// Piped instances — each exposes GET /streams/{videoId}
-// returning { audioStreams: [{ url, bitrate, videoOnly }] }
-const PIPED_INSTANCES = [
-  'https://pipedapi.kavin.rocks',
-  'https://pipedapi.adminforge.de',
-  'https://pipedapi.ducks.party',
-  'https://api.piped.yt',
-  'https://pipedapi.reallyaweso.me',
-  'https://api.piped.private.coffee',
-  'https://piped-api.privacy.com.de',
-  'https://pipedapi.darkness.services',
-  'https://pipedapi.nosebs.ru',
-  'https://pipedapi.leptons.xyz',
+// ── Cobalt instances (https://cobalt.tools)
+// Each accepts POST /  with { url, downloadMode:'audio', audioFormat:'best' }
+// and returns { status:'tunnel'|'redirect'|'stream', url }
+const COBALT_INSTANCES = [
+  'https://cobalt.tools/api',       // official – may have CORS on some browsers; works in WKWebView
+  'https://cobalt.blahai.ch',
+  'https://cobalt.api.timelessnesses.me',
+  'https://cobalt.catvibers.me',
+  'https://api.cobalt.tools',
 ];
 
-// Invidious instances — GET /api/v1/videos/{videoId}?fields=adaptiveFormats
+// ── Invidious fallbacks
 const INVIDIOUS_INSTANCES = [
   'https://yewtu.be',
   'https://inv.nadeko.net',
@@ -74,9 +75,14 @@ const INVIDIOUS_INSTANCES = [
   'https://invidious.fdn.fr',
 ];
 
-// Remember which instance worked last (persisted across plays in session)
-let _lastGoodPiped = 0;
-let _lastGoodInv   = 0;
+// ── Piped last-resort fallbacks
+const PIPED_INSTANCES = [
+  'https://pipedapi.kavin.rocks',
+  'https://pipedapi.adminforge.de',
+  'https://api.piped.yt',
+  'https://api.piped.private.coffee',
+  'https://piped-api.privacy.com.de',
+];
 
 // The single native audio element
 const AUDIO = new Audio();
@@ -118,11 +124,12 @@ function onAudioEnded() {
 }
 
 function onAudioError() {
-  // The URL we got worked at fetch time but failed to stream — try next batch
-  console.warn('Audio stream error, retrying with next sources');
+  // The URL resolved but the <audio> element couldn't play it (CORS, expired sig, etc.)
+  // Skip wave 1 (Cobalt) and retry from Invidious onward.
+  console.warn('Audio element error, retrying with fallback sources');
   if (state.currentTrack && !state._streamExhausted) {
     state._streamExhausted = true; // prevent infinite loop
-    loadStreamForTrack(state.currentTrack, true /* skipFirst */);
+    loadStreamForTrack(state.currentTrack, true /* skipCobalt */);
   } else {
     showLoadingState(false);
     toast('Stream failed — tap ↻ to retry or skip');
@@ -131,21 +138,36 @@ function onAudioError() {
 }
 
 /* ── STREAM RESOLUTION ── */
-// Fetches one Piped instance
-async function tryPiped(baseUrl, videoId, signal) {
-  const res = await fetch(`${baseUrl}/streams/${videoId}`, { signal });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+// ── Cobalt: POST the YouTube URL, get back a direct audio stream
+async function tryCobalt(baseUrl, videoId, signal) {
+  const res = await fetch(`${baseUrl}`, {
+    method: 'POST',
+    signal,
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+    body: JSON.stringify({
+      url: `https://www.youtube.com/watch?v=${videoId}`,
+      downloadMode: 'audio',
+      audioFormat: 'best',
+      filenameStyle: 'basic',
+    }),
+  });
+  if (!res.ok) throw new Error(`Cobalt HTTP ${res.status}`);
   const data = await res.json();
-  const streams = (data.audioStreams || []).filter(s => !s.videoOnly && s.url);
-  if (!streams.length) throw new Error('no audio streams');
-  streams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-  return streams[0].url;
+  // Cobalt returns { status: 'tunnel'|'redirect'|'stream', url } on success
+  if (!data.url || (data.status !== 'tunnel' && data.status !== 'redirect' && data.status !== 'stream')) {
+    throw new Error(`Cobalt bad status: ${data.status}`);
+  }
+  return data.url;
 }
 
-// Fetches one Invidious instance
+// ── Invidious: GET adaptive formats, pick best audio-only
 async function tryInvidious(baseUrl, videoId, signal) {
   const res = await fetch(`${baseUrl}/api/v1/videos/${videoId}?fields=adaptiveFormats`, { signal });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`Invidious HTTP ${res.status}`);
   const data = await res.json();
   const formats = (data.adaptiveFormats || []).filter(f => f.type?.startsWith('audio/') && f.url);
   if (!formats.length) throw new Error('no audio formats');
@@ -153,84 +175,88 @@ async function tryInvidious(baseUrl, videoId, signal) {
   return formats[0].url;
 }
 
-// Races a batch of instances — returns the first URL that resolves
+// ── Piped: GET /streams/{id}, pick best audio stream
+async function tryPiped(baseUrl, videoId, signal) {
+  const res = await fetch(`${baseUrl}/streams/${videoId}`, { signal });
+  if (!res.ok) throw new Error(`Piped HTTP ${res.status}`);
+  const data = await res.json();
+  const streams = (data.audioStreams || []).filter(s => !s.videoOnly && s.url);
+  if (!streams.length) throw new Error('no audio streams');
+  streams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+  return streams[0].url;
+}
+
+// ── Race a batch of async fetchers — resolves with the first winner
 async function raceBatch(fetchers) {
   return new Promise((resolve, reject) => {
-    let settled = 0;
-    let resolved = false;
+    let settled = 0, resolved = false;
     const total = fetchers.length;
     if (!total) { reject(new Error('no fetchers')); return; }
     fetchers.forEach(fn => {
       fn().then(url => {
         if (!resolved) { resolved = true; resolve(url); }
       }).catch(() => {
-        settled++;
-        if (settled === total && !resolved) reject(new Error('all failed'));
+        if (++settled === total && !resolved) reject(new Error('all failed'));
       });
     });
   });
 }
 
-// Main resolver: races first-choice instances, falls back to rest if needed
+// ── Main resolver: Cobalt first (raced), then Invidious, then Piped
 async function resolveAudioUrl(videoId, skipFirst = false) {
-  const TIMEOUT = 7000;
+  const TIMEOUT = 9000;
 
-  // Build ordered instance lists, starting from last known-good
-  const pipedOrdered = [
-    ...PIPED_INSTANCES.slice(_lastGoodPiped),
-    ...PIPED_INSTANCES.slice(0, _lastGoodPiped),
-  ];
-  const invOrdered = [
-    ...INVIDIOUS_INSTANCES.slice(_lastGoodInv),
-    ...INVIDIOUS_INSTANCES.slice(0, _lastGoodInv),
-  ];
-
-  // First wave: race top 3 of each type simultaneously
+  // ── Wave 1: race all Cobalt instances simultaneously (fastest wins)
   if (!skipFirst) {
-    const ac1 = new AbortController();
-    const t1  = setTimeout(() => ac1.abort(), TIMEOUT);
-    try {
-      const firstWave = [
-        ...pipedOrdered.slice(0, 3).map((u, i) => async () => {
-          const url = await tryPiped(u, videoId, ac1.signal);
-          _lastGoodPiped = PIPED_INSTANCES.indexOf(u);
-          return url;
-        }),
-        ...invOrdered.slice(0, 2).map((u, i) => async () => {
-          const url = await tryInvidious(u, videoId, ac1.signal);
-          _lastGoodInv = INVIDIOUS_INSTANCES.indexOf(u);
-          return url;
-        }),
-      ];
-      const url = await raceBatch(firstWave);
-      clearTimeout(t1);
-      return url;
-    } catch {
-      clearTimeout(t1);
-      // Fall through to second wave
-    }
-  }
-
-  // Second wave: try the remaining instances sequentially
-  const remaining = [
-    ...pipedOrdered.slice(skipFirst ? 0 : 3).map(u => ({ type: 'piped', u })),
-    ...invOrdered.slice(skipFirst ? 0 : 2).map(u => ({ type: 'inv', u })),
-  ];
-  for (const { type, u } of remaining) {
     const ac = new AbortController();
     const t  = setTimeout(() => ac.abort(), TIMEOUT);
     try {
-      const url = type === 'piped'
-        ? await tryPiped(u, videoId, ac.signal)
-        : await tryInvidious(u, videoId, ac.signal);
+      const url = await raceBatch(
+        COBALT_INSTANCES.map(base => () => tryCobalt(base, videoId, ac.signal))
+      );
       clearTimeout(t);
-      if (type === 'piped') _lastGoodPiped = PIPED_INSTANCES.indexOf(u);
-      else                  _lastGoodInv   = INVIDIOUS_INSTANCES.indexOf(u);
+      console.log('✓ Cobalt resolved audio');
       return url;
     } catch {
       clearTimeout(t);
+      console.warn('Cobalt wave failed, trying Invidious…');
     }
   }
+
+  // ── Wave 2: race Invidious instances
+  {
+    const ac = new AbortController();
+    const t  = setTimeout(() => ac.abort(), TIMEOUT);
+    try {
+      const url = await raceBatch(
+        INVIDIOUS_INSTANCES.map(base => () => tryInvidious(base, videoId, ac.signal))
+      );
+      clearTimeout(t);
+      console.log('✓ Invidious resolved audio');
+      return url;
+    } catch {
+      clearTimeout(t);
+      console.warn('Invidious wave failed, trying Piped…');
+    }
+  }
+
+  // ── Wave 3: race Piped instances (last resort)
+  {
+    const ac = new AbortController();
+    const t  = setTimeout(() => ac.abort(), TIMEOUT);
+    try {
+      const url = await raceBatch(
+        PIPED_INSTANCES.map(base => () => tryPiped(base, videoId, ac.signal))
+      );
+      clearTimeout(t);
+      console.log('✓ Piped resolved audio');
+      return url;
+    } catch {
+      clearTimeout(t);
+      console.warn('All audio sources exhausted for', videoId);
+    }
+  }
+
   return null;
 }
 
