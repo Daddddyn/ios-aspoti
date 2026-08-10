@@ -511,7 +511,7 @@ function removeFromPlaylist(playlistId, videoId) {
 
 /* ── YOUTUBE SEARCH ── */
 async function searchYouTube(query) {
-  const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoCategoryId=10&maxResults=20&q=${encodeURIComponent(query)}&key=${state.apiKey}`;
+  const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=20&q=${encodeURIComponent(query)}&key=${state.apiKey}`;
   try {
     const res = await fetch(url);
     if (!res.ok) {
