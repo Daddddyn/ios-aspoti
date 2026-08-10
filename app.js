@@ -40,269 +40,128 @@ const save = {
 };
 
 /* ════════════════════════════════════════════════════
-   NATIVE AUDIO ENGINE
-   Uses a real <audio> element — iOS keeps this playing
-   in background / screen off when AVAudioSession is set
-   to .playback in the native AppDelegate (already done).
+   AUDIO ENGINE — YouTube IFrame Player API
+   
+   Every third-party audio extractor (Piped, Invidious,
+   Cobalt) is now 403ing or dead. The IFrame Player API
+   is the only reliable YouTube audio source.
 
-   Stream resolution chain (tried in order):
-     1. Cobalt API  — actively maintained, most reliable
-     2. Invidious   — fallback public instances
-     3. Piped       — last resort
-
-   All three return a direct audio URL that the <audio>
-   element can play without any proxy.
+   Background audio on iOS (Capacitor): works because
+   AppDelegate sets AVAudioSession.playback, which keeps
+   WKWebView audio alive when the screen locks.
+   The iframe is hidden (1×1px, off-screen) — the user
+   sees your custom UI, not the YouTube player.
    ════════════════════════════════════════════════════ */
 
-// ── Cobalt instances (https://cobalt.tools)
-// Each accepts POST /  with { url, downloadMode:'audio', audioFormat:'best' }
-// and returns { status:'tunnel'|'redirect'|'stream', url }
-const COBALT_INSTANCES = [
-  'https://cobalt.tools/api',       // official – may have CORS on some browsers; works in WKWebView
-  'https://cobalt.blahai.ch',
-  'https://cobalt.api.timelessnesses.me',
-  'https://cobalt.catvibers.me',
-  'https://api.cobalt.tools',
-];
+/* ── Inject YouTube IFrame API script once ── */
+(function loadYTScript() {
+  if (document.getElementById('yt-iframe-api')) return;
+  const s = document.createElement('script');
+  s.id  = 'yt-iframe-api';
+  s.src = 'https://www.youtube.com/iframe_api';
+  document.head.appendChild(s);
+})();
 
-// ── Invidious fallbacks
-const INVIDIOUS_INSTANCES = [
-  'https://yewtu.be',
-  'https://inv.nadeko.net',
-  'https://invidious.privacyredirect.com',
-  'https://invidious.nerdvpn.de',
-  'https://iv.melmac.space',
-  'https://invidious.fdn.fr',
-];
+/* ── Hidden iframe container (1×1, off-screen) ── */
+const _ytContainer = document.createElement('div');
+_ytContainer.style.cssText = 'position:fixed;left:-2px;top:-2px;width:1px;height:1px;opacity:0;pointer-events:none;';
+document.body.appendChild(_ytContainer);
 
-// ── Piped last-resort fallbacks
-const PIPED_INSTANCES = [
-  'https://pipedapi.kavin.rocks',
-  'https://pipedapi.adminforge.de',
-  'https://api.piped.yt',
-  'https://api.piped.private.coffee',
-  'https://piped-api.privacy.com.de',
-];
+let YTPlayer   = null;   // the YT.Player instance
+let _ytReady   = false;  // API loaded
+let _pendingId = null;   // videoId to play once player is ready
+let _ytDurTimer = null;
 
-// The single native audio element
-const AUDIO = new Audio();
-AUDIO.preload = 'none';
-AUDIO.setAttribute('playsinline', '');
-
-// Wire up audio events
-AUDIO.addEventListener('play',            () => onAudioPlay());
-AUDIO.addEventListener('pause',           () => onAudioPause());
-AUDIO.addEventListener('ended',           () => onAudioEnded());
-AUDIO.addEventListener('error',           () => onAudioError());
-AUDIO.addEventListener('waiting',         () => showLoadingState(true));
-AUDIO.addEventListener('canplay',         () => showLoadingState(false));
-AUDIO.addEventListener('loadedmetadata',  () => { state.currentDuration = AUDIO.duration || 0; });
-
-function onAudioPlay() {
-  state.playing = true;
-  state.loading = false;
-  showLoadingState(false);
-  updatePlayIcons(true);
-  artContainer.classList.add('playing');
-  artContainer.classList.remove('paused');
-  startProgressLoop();
-  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
-}
-
-function onAudioPause() {
-  state.playing = false;
-  updatePlayIcons(false);
-  artContainer.classList.remove('playing');
-  artContainer.classList.add('paused');
-  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
-}
-
-function onAudioEnded() {
-  state.playing = false;
-  if (state.repeat === 'one') { AUDIO.currentTime = 0; AUDIO.play().catch(() => {}); }
-  else seekNext();
-}
-
-function onAudioError() {
-  // The URL resolved but the <audio> element couldn't play it (CORS, expired sig, etc.)
-  // Skip wave 1 (Cobalt) and retry from Invidious onward.
-  console.warn('Audio element error, retrying with fallback sources');
-  if (state.currentTrack && !state._streamExhausted) {
-    state._streamExhausted = true; // prevent infinite loop
-    loadStreamForTrack(state.currentTrack, true /* skipCobalt */);
-  } else {
-    showLoadingState(false);
-    toast('Stream failed — tap ↻ to retry or skip');
-    showRetryButton(true);
-  }
-}
-
-/* ── STREAM RESOLUTION ── */
-
-// ── Cobalt: POST the YouTube URL, get back a direct audio stream
-async function tryCobalt(baseUrl, videoId, signal) {
-  const res = await fetch(`${baseUrl}`, {
-    method: 'POST',
-    signal,
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
+/* Called by YouTube IFrame API when it finishes loading */
+window.onYouTubeIframeAPIReady = function () {
+  _ytReady = true;
+  YTPlayer = new YT.Player(_ytContainer, {
+    width: '1', height: '1',
+    playerVars: {
+      autoplay: 0,
+      controls: 0,
+      disablekb: 1,
+      fs: 0,
+      iv_load_policy: 3,
+      modestbranding: 1,
+      playsinline: 1,
+      rel: 0,
     },
-    body: JSON.stringify({
-      url: `https://www.youtube.com/watch?v=${videoId}`,
-      downloadMode: 'audio',
-      audioFormat: 'best',
-      filenameStyle: 'basic',
-    }),
+    events: {
+      onReady:       _onYTReady,
+      onStateChange: _onYTStateChange,
+      onError:       _onYTError,
+    },
   });
-  if (!res.ok) throw new Error(`Cobalt HTTP ${res.status}`);
-  const data = await res.json();
-  // Cobalt returns { status: 'tunnel'|'redirect'|'stream', url } on success
-  if (!data.url || (data.status !== 'tunnel' && data.status !== 'redirect' && data.status !== 'stream')) {
-    throw new Error(`Cobalt bad status: ${data.status}`);
+};
+
+function _onYTReady() {
+  if (_pendingId) {
+    YTPlayer.loadVideoById({ videoId: _pendingId, suggestedQuality: 'small' });
+    _pendingId = null;
   }
-  return data.url;
 }
 
-// ── Invidious: GET adaptive formats, pick best audio-only
-async function tryInvidious(baseUrl, videoId, signal) {
-  const res = await fetch(`${baseUrl}/api/v1/videos/${videoId}?fields=adaptiveFormats`, { signal });
-  if (!res.ok) throw new Error(`Invidious HTTP ${res.status}`);
-  const data = await res.json();
-  const formats = (data.adaptiveFormats || []).filter(f => f.type?.startsWith('audio/') && f.url);
-  if (!formats.length) throw new Error('no audio formats');
-  formats.sort((a, b) => parseInt(b.bitrate || 0) - parseInt(a.bitrate || 0));
-  return formats[0].url;
-}
-
-// ── Piped: GET /streams/{id}, pick best audio stream
-async function tryPiped(baseUrl, videoId, signal) {
-  const res = await fetch(`${baseUrl}/streams/${videoId}`, { signal });
-  if (!res.ok) throw new Error(`Piped HTTP ${res.status}`);
-  const data = await res.json();
-  const streams = (data.audioStreams || []).filter(s => !s.videoOnly && s.url);
-  if (!streams.length) throw new Error('no audio streams');
-  streams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-  return streams[0].url;
-}
-
-// ── Race a batch of async fetchers — resolves with the first winner
-async function raceBatch(fetchers) {
-  return new Promise((resolve, reject) => {
-    let settled = 0, resolved = false;
-    const total = fetchers.length;
-    if (!total) { reject(new Error('no fetchers')); return; }
-    fetchers.forEach(fn => {
-      fn().then(url => {
-        if (!resolved) { resolved = true; resolve(url); }
-      }).catch(() => {
-        if (++settled === total && !resolved) reject(new Error('all failed'));
-      });
-    });
-  });
-}
-
-// ── Main resolver: Cobalt first (raced), then Invidious, then Piped
-async function resolveAudioUrl(videoId, skipFirst = false) {
-  const TIMEOUT = 9000;
-
-  // ── Wave 1: race all Cobalt instances simultaneously (fastest wins)
-  if (!skipFirst) {
-    const ac = new AbortController();
-    const t  = setTimeout(() => ac.abort(), TIMEOUT);
-    try {
-      const url = await raceBatch(
-        COBALT_INSTANCES.map(base => () => tryCobalt(base, videoId, ac.signal))
-      );
-      clearTimeout(t);
-      console.log('✓ Cobalt resolved audio');
-      return url;
-    } catch {
-      clearTimeout(t);
-      console.warn('Cobalt wave failed, trying Invidious…');
-    }
+function _onYTStateChange(e) {
+  const S = YT.PlayerState;
+  if (e.data === S.PLAYING) {
+    state.playing = true;
+    state.loading  = false;
+    state.currentDuration = YTPlayer.getDuration() || 0;
+    showLoadingState(false);
+    updatePlayIcons(true);
+    artContainer.classList.add('playing');
+    artContainer.classList.remove('paused');
+    startProgressLoop();
+    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+  } else if (e.data === S.PAUSED) {
+    state.playing = false;
+    updatePlayIcons(false);
+    artContainer.classList.remove('playing');
+    artContainer.classList.add('paused');
+    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+  } else if (e.data === S.ENDED) {
+    state.playing = false;
+    if (state.repeat === 'one') { YTPlayer.seekTo(0); YTPlayer.playVideo(); }
+    else seekNext();
+  } else if (e.data === S.BUFFERING) {
+    showLoadingState(true);
   }
-
-  // ── Wave 2: race Invidious instances
-  {
-    const ac = new AbortController();
-    const t  = setTimeout(() => ac.abort(), TIMEOUT);
-    try {
-      const url = await raceBatch(
-        INVIDIOUS_INSTANCES.map(base => () => tryInvidious(base, videoId, ac.signal))
-      );
-      clearTimeout(t);
-      console.log('✓ Invidious resolved audio');
-      return url;
-    } catch {
-      clearTimeout(t);
-      console.warn('Invidious wave failed, trying Piped…');
-    }
-  }
-
-  // ── Wave 3: race Piped instances (last resort)
-  {
-    const ac = new AbortController();
-    const t  = setTimeout(() => ac.abort(), TIMEOUT);
-    try {
-      const url = await raceBatch(
-        PIPED_INSTANCES.map(base => () => tryPiped(base, videoId, ac.signal))
-      );
-      clearTimeout(t);
-      console.log('✓ Piped resolved audio');
-      return url;
-    } catch {
-      clearTimeout(t);
-      console.warn('All audio sources exhausted for', videoId);
-    }
-  }
-
-  return null;
 }
 
-async function loadStreamForTrack(track, skipFirst = false) {
-  state._streamExhausted = false;
+function _onYTError(e) {
+  console.warn('YT player error:', e.data);
+  // 100 = not found, 101/150 = embedding disabled
+  showLoadingState(false);
+  showRetryButton(true);
+  toast('Can\'t play this track — try the next one');
+}
+
+/* ── Core play/pause/seek wrappers ── */
+function _ytLoad(videoId) {
   showLoadingState(true);
   showRetryButton(false);
-
-  const audioUrl = await resolveAudioUrl(track.videoId, skipFirst);
-
-  if (!audioUrl) {
-    showLoadingState(false);
-    showRetryButton(true);
-    toast('No audio source available — tap ↻ to retry');
+  if (!_ytReady || !YTPlayer) {
+    _pendingId = videoId;
     return;
   }
-
-  // Bail if user switched tracks while we were fetching
-  if (state.currentTrack?.videoId !== track.videoId) return;
-
-  AUDIO.src = audioUrl;
-  AUDIO.volume = state.volumeLevel / 100;
-  AUDIO.load();
-  AUDIO.play().catch(e => {
-    console.warn('play() rejected:', e.message);
-    showLoadingState(false);
-    updatePlayIcons(false);
-  });
+  YTPlayer.loadVideoById({ videoId, suggestedQuality: 'small' });
 }
 
 // Show/hide a retry button in the now-playing sheet
 function showRetryButton(show) {
-  let btn = el('np-retry');
+  const btn = el('np-retry');
   if (!btn) return;
   btn.style.display = show ? '' : 'none';
 }
 
 /* ── PLAYBACK CONTROLS ── */
-async function playTrack(track, queueOverride, idx) {
+function playTrack(track, queueOverride, idx) {
   if (queueOverride) { state.queue = queueOverride; state.queueIdx = idx ?? 0; }
   state.currentTrack = track;
   state.playing = false;
-  state.loading = true;
-  state._streamAttempt = 0;
+  state.loading  = true;
 
-  // Immediately update UI
   updateNowPlaying(track);
   updateMiniPlayer(track);
   updateArtColor(track.thumb);
@@ -311,26 +170,24 @@ async function playTrack(track, queueOverride, idx) {
   showLoadingState(true);
   addToHistory(track);
 
-  // Kick off stream resolution (race first batch of instances)
-  loadStreamForTrack(track, false);
+  _ytLoad(track.videoId);
 }
 
 function togglePlayPause() {
-  if (!state.currentTrack) return;
+  if (!state.currentTrack || !YTPlayer) return;
   if (state.playing) {
-    AUDIO.pause();
+    YTPlayer.pauseVideo();
   } else {
-    if (!AUDIO.src || AUDIO.src === window.location.href) {
-      // No src yet — reload stream
-      loadStreamForTrack(state.currentTrack, false);
+    if (!YTPlayer.getVideoData?.()?.video_id) {
+      _ytLoad(state.currentTrack.videoId);
     } else {
-      AUDIO.play().catch(() => {});
+      YTPlayer.playVideo();
     }
   }
 }
 
 function seekPrev() {
-  if (AUDIO.currentTime > 3) { AUDIO.currentTime = 0; return; }
+  if (YTPlayer && YTPlayer.getCurrentTime() > 3) { YTPlayer.seekTo(0); return; }
   if (state.queueIdx > 0) {
     state.queueIdx--;
     playTrack(state.queue[state.queueIdx]);
@@ -379,9 +236,9 @@ let progressRAF = null;
 function startProgressLoop() {
   if (progressRAF) cancelAnimationFrame(progressRAF);
   function tick() {
-    if (!state.playing) return;
-    const cur = AUDIO.currentTime || 0;
-    const dur = AUDIO.duration   || 0;
+    if (!state.playing || !YTPlayer) return;
+    const cur = YTPlayer.getCurrentTime?.() || 0;
+    const dur = YTPlayer.getDuration?.()    || 0;
     state.currentDuration = dur;
     const pct = dur ? (cur / dur) * 100 : 0;
     updateProgressUI(pct, cur, dur);
@@ -416,18 +273,18 @@ function setupMediaSession(track) {
       { src: track.thumb, sizes: '640x360', type: 'image/jpeg' },
     ] : [],
   });
-  navigator.mediaSession.setActionHandler('play',          () => AUDIO.play().catch(() => {}));
-  navigator.mediaSession.setActionHandler('pause',         () => AUDIO.pause());
+  navigator.mediaSession.setActionHandler('play',          () => YTPlayer?.playVideo());
+  navigator.mediaSession.setActionHandler('pause',         () => YTPlayer?.pauseVideo());
   navigator.mediaSession.setActionHandler('previoustrack', () => seekPrev());
   navigator.mediaSession.setActionHandler('nexttrack',     () => seekNext());
   navigator.mediaSession.setActionHandler('seekto', e => {
-    if (state.currentDuration) AUDIO.currentTime = e.seekTime;
+    if (state.currentDuration && YTPlayer) YTPlayer.seekTo(e.seekTime, true);
   });
   navigator.mediaSession.setActionHandler('seekbackward', e => {
-    AUDIO.currentTime = Math.max(0, AUDIO.currentTime - (e.seekOffset || 10));
+    if (YTPlayer) YTPlayer.seekTo(Math.max(0, YTPlayer.getCurrentTime() - (e.seekOffset || 10)), true);
   });
   navigator.mediaSession.setActionHandler('seekforward', e => {
-    AUDIO.currentTime = Math.min(AUDIO.duration || 0, AUDIO.currentTime + (e.seekOffset || 10));
+    if (YTPlayer) YTPlayer.seekTo(Math.min(state.currentDuration || 0, YTPlayer.getCurrentTime() + (e.seekOffset || 10)), true);
   });
 }
 
@@ -511,7 +368,7 @@ function removeFromPlaylist(playlistId, videoId) {
 
 /* ── YOUTUBE SEARCH ── */
 async function searchYouTube(query) {
-  const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=20&q=${encodeURIComponent(query)}&key=${state.apiKey}`;
+  const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoCategoryId=10&maxResults=20&q=${encodeURIComponent(query)}&key=${state.apiKey}`;
   try {
     const res = await fetch(url);
     if (!res.ok) {
@@ -906,7 +763,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Volume init
   const volSlider = el('np-volume');
-  AUDIO.volume = state.volumeLevel / 100;
   volSlider.value = state.volumeLevel;
   volSlider.style.setProperty('--vol-pct', state.volumeLevel + '%');
 
@@ -975,7 +831,7 @@ document.addEventListener('DOMContentLoaded', () => {
     npRetry.addEventListener('click', () => {
       if (state.currentTrack) {
         showRetryButton(false);
-        loadStreamForTrack(state.currentTrack, false);
+        _ytLoad(state.currentTrack.videoId);
       }
     });
   }
@@ -994,15 +850,15 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   el('np-progress').addEventListener('input', e => {
-    if (!state.currentDuration) return;
+    if (!state.currentDuration || !YTPlayer) return;
     const pct = parseFloat(e.target.value);
-    AUDIO.currentTime = (pct / 100) * state.currentDuration;
+    YTPlayer.seekTo((pct / 100) * state.currentDuration, true);
     e.target.style.setProperty('--pct', pct + '%');
   });
 
   el('np-volume').addEventListener('input', e => {
     state.volumeLevel = parseInt(e.target.value);
-    AUDIO.volume = state.volumeLevel / 100;
+    if (YTPlayer) YTPlayer.setVolume(state.volumeLevel);
     save.volume();
     e.target.style.setProperty('--vol-pct', state.volumeLevel + '%');
   });
