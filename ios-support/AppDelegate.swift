@@ -18,7 +18,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
             try AVAudioSession.sharedInstance().setCategory(
                 .playback,
                 mode: .default,
-                options: []
+                options: [.allowBluetooth, .allowAirPlay]
             )
             try AVAudioSession.sharedInstance().setActive(true)
         } catch {
@@ -26,6 +26,12 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         }
         UIApplication.shared.beginReceivingRemoteControlEvents()
         // ─────────────────────────────────────────────────────────────
+
+        // Required since iOS 17.5: WKWebView needs a custom user agent
+        // or external network requests silently fail with auth errors.
+        UserDefaults.standard.register(defaults: [
+            "UserAgent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+        ])
 
         return true
     }
